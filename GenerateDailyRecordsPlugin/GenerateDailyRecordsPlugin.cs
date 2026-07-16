@@ -19,8 +19,16 @@ namespace GenerateDailyRecordsPlugin
 
             var service = factory.CreateOrganizationService(context.UserId);
             tracing.Trace("ucm_GenerateDailyRecords started. Correlation: {0}", context.CorrelationId);
-            new DailyRecordService(service, tracing, DateTime.UtcNow.Date).Generate();
-            tracing.Trace("ucm_GenerateDailyRecords completed.");
+            try
+            {
+                new DailyRecordService(service, tracing, DateTime.UtcNow.Date).Generate();
+                tracing.Trace("ucm_GenerateDailyRecords completed.");
+            }
+            catch (Exception ex)
+            {
+                tracing.Trace("ucm_GenerateDailyRecords failed. Correlation: {0}. Exception: {1}", context.CorrelationId, ex);
+                throw;
+            }
         }
     }
 }
