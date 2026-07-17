@@ -14,6 +14,7 @@ namespace GenerateDailyRecordsPlugin
         private readonly ITracingService trace;
         private readonly DateTime today;
         private readonly Dictionary<string, int> optionValueCache = new Dictionary<string, int>();
+        private readonly HashSet<string> tracedLookupFields = new HashSet<string>();
         internal DailyRecordService(IOrganizationService service, ITracingService trace, DateTime today) { this.service = service; this.trace = trace; this.today = today.Date; }
         internal void Generate()
         {
@@ -34,15 +35,27 @@ namespace GenerateDailyRecordsPlugin
             var census = new Entity(SchemaNames.Entities.DailyCensus); census[SchemaNames.Fields.Name] = NameHelper.Census(facilityName, today); census[SchemaNames.Fields.Facility] = facility.ToEntityReference();
             var dailyId = service.Create(census); var daily = new EntityReference(SchemaNames.Entities.DailyCensus, dailyId);
             trace.Trace("Created Daily Census {0} for facility '{1}'.", dailyId, facilityName);
+            TraceLookupTargets(SchemaNames.Entities.UnitCensusResident, SchemaNames.Fields.DailyCensus);
+            TraceLookupTargets(SchemaNames.Entities.UnitCensusResident, SchemaNames.Fields.UnitCensus);
             var areas = Query(SchemaNames.Entities.LivingArea, new ColumnSet(SchemaNames.Fields.Name), Filter(SchemaNames.Fields.Facility, ConditionOperator.Equal, facility.Id));
             trace.Trace("Found {0} Living Areas for facility '{1}'.", areas.Count, facilityName);
-            var units = new Dictionary<Guid, EntityReference>();
+            var unitCreates = new List<Entity>();
             foreach (var area in areas)
             {
                 var unit = new Entity(SchemaNames.Entities.UnitCensus); unit[SchemaNames.Fields.Name] = NameHelper.Census(area.GetAttributeValue<string>(SchemaNames.Fields.Name) ?? area.Id.ToString(), today); unit[SchemaNames.Fields.DailyCensus] = daily; unit[SchemaNames.Fields.Facility] = facility.ToEntityReference(); unit[SchemaNames.Fields.LivingArea] = area.ToEntityReference();
-                var unitId = service.Create(unit);
-                units.Add(area.Id, new EntityReference(SchemaNames.Entities.UnitCensus, unitId));
-                trace.Trace("Created Unit Census {0} for Living Area '{1}' ({2}).", unitId, area.GetAttributeValue<string>(SchemaNames.Fields.Name) ?? "(no name)", area.Id);
+                unitCreates.Add(unit);
+            }
+            var createdUnits = CreateBatch(unitCreates, "Unit Census");
+            if (createdUnits.Count != unitCreates.Count)
+            {
+                trace.Trace("Skipped Unit Census Resident and Day of Care creation for facility '{0}': only {1} of {2} Unit Census records were created successfully.", facilityName, createdUnits.Count, unitCreates.Count);
+                return;
+            }
+            var units = createdUnits.ToDictionary(x => x.GetAttributeValue<EntityReference>(SchemaNames.Fields.LivingArea).Id, x => x.ToEntityReference());
+            foreach (var unit in createdUnits)
+            {
+                var area = unit.GetAttributeValue<EntityReference>(SchemaNames.Fields.LivingArea);
+                trace.Trace("Created Unit Census {0} for Living Area {1}.", unit.Id, area == null ? "(blank)" : area.Id.ToString());
             }
             var records = Query(SchemaNames.Entities.FacilityRecord, new ColumnSet(SchemaNames.Fields.FacilityRecordFacility, SchemaNames.Fields.CurrentLivingArea, SchemaNames.Fields.FacilityRecordJuvenile, SchemaNames.Fields.PlacingCounty), Filter(SchemaNames.Fields.FacilityRecordFacility, ConditionOperator.Equal, facility.Id), Filter(SchemaNames.Fields.StateCode, ConditionOperator.Equal, 0));
             trace.Trace("Found {0} active Facility Records for facility '{1}'.", records.Count, facilityName);
@@ -94,8 +107,8 @@ namespace GenerateDailyRecordsPlugin
                 if (juvenile != null) care["ucm_bjjsid"] = bjjsId; if (record.Contains(SchemaNames.Fields.PlacingCounty)) care[SchemaNames.Fields.PlacingCounty] = record[SchemaNames.Fields.PlacingCounty]; careCreates.Add(care);
                 trace.Trace("Queued Day of Care for Facility Record {0}. Days Away={1}; Billing={2} ({3}); Reason={4} ({5}).", record.Id, daysAway, billingLabel, billingValue.HasValue ? billingValue.Value.ToString() : "not found", reasonLabel ?? "(purpose blank)", reasonValue.HasValue ? reasonValue.Value.ToString() : "not set");
             }
-            CreateBatch(residentCreates, "Unit Census Resident"); CreateBatch(careCreates, "Day of Care"); foreach (var unit in units.Values) { var total = residentCreates.Count(r => ((EntityReference)r[SchemaNames.Fields.UnitCensus]).Id == unit.Id); var update = new Entity(SchemaNames.Entities.UnitCensus, unit.Id); update[SchemaNames.Fields.ResidentsTotal] = total; service.Update(update); trace.Trace("Updated Unit Census {0}: Total Residents={1}.", unit.Id, total); } var censusUpdate = new Entity(SchemaNames.Entities.DailyCensus, dailyId); censusUpdate[SchemaNames.Fields.ResidentsTotal] = residentCreates.Count; service.Update(censusUpdate);
-            trace.Trace("Completed {0}: {1} unit censuses, {2} residents, {3} day-of-care.", facilityName, units.Count, residentCreates.Count, careCreates.Count);
+            var createdResidents = CreateBatch(residentCreates, "Unit Census Resident"); var createdCare = CreateBatch(careCreates, "Day of Care"); foreach (var unit in units.Values) { var total = createdResidents.Count(r => ((EntityReference)r[SchemaNames.Fields.UnitCensus]).Id == unit.Id); var update = new Entity(SchemaNames.Entities.UnitCensus, unit.Id); update[SchemaNames.Fields.ResidentsTotal] = total; service.Update(update); trace.Trace("Updated Unit Census {0}: Total Residents={1}.", unit.Id, total); } var censusUpdate = new Entity(SchemaNames.Entities.DailyCensus, dailyId); censusUpdate[SchemaNames.Fields.ResidentsTotal] = createdResidents.Count; service.Update(censusUpdate);
+            trace.Trace("Completed {0}: {1} unit censuses, {2} residents, {3} day-of-care.", facilityName, units.Count, createdResidents.Count, createdCare.Count);
         }
         private List<Entity> Query(string name, ColumnSet columns, params FilterExpression[] filters) { var query = new QueryExpression(name) { ColumnSet = columns }; foreach (var filter in filters) query.Criteria.AddFilter(filter); return service.RetrieveMultiple(query).Entities.ToList(); }
         private static FilterExpression Filter(string field, ConditionOperator op, object value) { var filter = new FilterExpression(LogicalOperator.And); filter.AddCondition(field, op, value); return filter; }
@@ -129,12 +142,26 @@ namespace GenerateDailyRecordsPlugin
             optionValueCache[cacheKey] = matchingOption.Value.Value;
             return matchingOption.Value.Value;
         }
+        private void TraceLookupTargets(string entityName, string fieldName)
+        {
+            var cacheKey = entityName + ":" + fieldName;
+            if (!tracedLookupFields.Add(cacheKey)) return;
+            try
+            {
+                var request = new RetrieveAttributeRequest { EntityLogicalName = entityName, LogicalName = fieldName, RetrieveAsIfPublished = true };
+                var response = (RetrieveAttributeResponse)service.Execute(request);
+                var attribute = response.AttributeMetadata as LookupAttributeMetadata;
+                trace.Trace("Lookup configuration {0}.{1}: Targets={2}.", entityName, fieldName, attribute == null ? "(field is not a lookup)" : string.Join(", ", attribute.Targets));
+            }
+            catch (Exception ex) { trace.Trace("Could not read lookup configuration for {0}.{1}. Exception: {2}", entityName, fieldName, ex); }
+        }
         private static string OptionLabel(OptionMetadata option) { return option.Label == null ? "" : option.Label.UserLocalizedLabel == null ? option.Label.LocalizedLabels.Select(x => x.Label).FirstOrDefault() ?? "" : option.Label.UserLocalizedLabel.Label; }
         private static string NormalizeLabel(string label) { return (label ?? "").Replace('\u2013', '-').Replace('\u2014', '-').Trim().ToUpperInvariant(); }
-        private void CreateBatch(List<Entity> entities, string entityLabel)
+        private List<Entity> CreateBatch(List<Entity> entities, string entityLabel)
         {
-            if (entities.Count == 0) { trace.Trace("No {0} records to create.", entityLabel); return; }
-            var request = new ExecuteMultipleRequest { Settings = new ExecuteMultipleSettings { ContinueOnError = false, ReturnResponses = true }, Requests = new OrganizationRequestCollection() };
+            var created = new List<Entity>();
+            if (entities.Count == 0) { trace.Trace("No {0} records to create.", entityLabel); return created; }
+            var request = new ExecuteMultipleRequest { Settings = new ExecuteMultipleSettings { ContinueOnError = true, ReturnResponses = true }, Requests = new OrganizationRequestCollection() };
             foreach (var entity in entities) request.Requests.Add(new CreateRequest { Target = entity });
             var response = (ExecuteMultipleResponse)service.Execute(request);
             var succeeded = 0;
@@ -157,9 +184,20 @@ namespace GenerateDailyRecordsPlugin
                 else
                 {
                     succeeded++;
+                    var createResponse = batchItem.Response as CreateResponse;
+                    if (createResponse == null || createResponse.id == Guid.Empty)
+                    {
+                        failed++;
+                        succeeded--;
+                        trace.Trace("Failed to create {0} at batch index {1}: Dataverse returned no record ID. Fields: {2}", entityLabel, index, DescribeFields(target));
+                        continue;
+                    }
+                    target.Id = createResponse.id;
+                    created.Add(entities[index]);
                 }
             }
             trace.Trace("{0} batch completed. Requested={1}; Succeeded={2}; Failed={3}; Not Executed={4}.", entityLabel, entities.Count, succeeded, failed, notExecuted);
+            return created;
         }
         private static string DescribeFields(Entity entity) { return string.Join(", ", entity.Attributes.Select(x => x.Key + "=" + (x.Value is EntityReference ? ReferenceId((EntityReference)x.Value) : x.Value is OptionSetValue ? ((OptionSetValue)x.Value).Value.ToString() : x.Value == null ? "(null)" : x.Value.ToString()))); }
         private static string FaultDetails(OrganizationServiceFault fault) { return fault == null ? "" : (string.IsNullOrWhiteSpace(fault.TraceText) ? "" : fault.TraceText) + (fault.InnerFault == null ? "" : " Inner Fault: " + FaultDetails(fault.InnerFault)); }
