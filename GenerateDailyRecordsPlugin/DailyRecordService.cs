@@ -78,8 +78,8 @@ namespace GenerateDailyRecordsPlugin
             var existingCareRecordIds = new HashSet<Guid>(existingCare.Where(x => x.Contains(SchemaNames.Fields.FacilityRecord)).Select(x => x.GetAttributeValue<EntityReference>(SchemaNames.Fields.FacilityRecord).Id));
             trace.Trace("Duplicate protection found {0} Unit Census Residents and {1} Day of Care records already created today.", existingResidentRecordIds.Count, existingCareRecordIds.Count);
             var juvenileIds = records.Where(r => r.Contains(SchemaNames.Fields.FacilityRecordJuvenile)).Select(r => r.GetAttributeValue<EntityReference>(SchemaNames.Fields.FacilityRecordJuvenile).Id).Distinct().ToArray();
-            var juveniles = juvenileIds.Length == 0 ? new List<Entity>() : Query(SchemaNames.Entities.Juvenile, new ColumnSet(SchemaNames.Fields.FullName, SchemaNames.Fields.BjjsId), FilterIn("ucm_offenderid", juvenileIds));
-            var bjjsByJuvenile = juveniles.ToDictionary(j => j.Id, j => j.GetAttributeValue<string>(SchemaNames.Fields.BjjsId));
+            var juveniles = juvenileIds.Length == 0 ? new List<Entity>() : Query(SchemaNames.Entities.Juvenile, new ColumnSet(SchemaNames.Fields.FullName, SchemaNames.Fields.JuvenileBjjsId), FilterIn("ucm_offenderid", juvenileIds));
+            var bjjsByJuvenile = juveniles.ToDictionary(j => j.Id, j => j.GetAttributeValue<string>(SchemaNames.Fields.JuvenileBjjsId));
             var residentNameByJuvenile = juveniles.ToDictionary(j => j.Id, j => j.GetAttributeValue<string>(SchemaNames.Fields.FullName));
             var absences = Query(SchemaNames.Entities.TemporaryAbsence, new ColumnSet(SchemaNames.Fields.FacilityRecordMovement, SchemaNames.Fields.Purpose, SchemaNames.Fields.AbsenceStart, SchemaNames.Fields.AbsenceEnd), Filter(SchemaNames.Fields.StateCode, ConditionOperator.Equal, 0), Filter(SchemaNames.Fields.AbsenceStart, ConditionOperator.OnOrBefore, today));
             var absenceByRecord = absences.Where(x => x.Contains(SchemaNames.Fields.FacilityRecordMovement) && (!x.Contains(SchemaNames.Fields.AbsenceEnd) || x.GetAttributeValue<DateTime>(SchemaNames.Fields.AbsenceEnd).Date >= today)).GroupBy(x => x.GetAttributeValue<EntityReference>(SchemaNames.Fields.FacilityRecordMovement).Id).ToDictionary(x => x.Key, x => x.First());
@@ -119,7 +119,7 @@ namespace GenerateDailyRecordsPlugin
                 var reasonValue = string.IsNullOrWhiteSpace(reasonLabel) ? (int?)null : FindOptionValue(SchemaNames.Entities.DayOfCare, SchemaNames.Fields.CensusCode, reasonLabel);
                 if (reasonValue.HasValue) care[SchemaNames.Fields.CensusCode] = new OptionSetValue(reasonValue.Value);
                 else trace.Trace("Day of Care reason was not set for Facility Record {0}. Source purpose={1}; matching Day of Care choice='{2}'.", record.Id, PurposeDetails(absence), reasonLabel ?? "(purpose blank)");
-                if (juvenile != null) care[SchemaNames.Fields.BjjsId] = bjjsId; if (record.Contains(SchemaNames.Fields.PlacingCounty)) care[SchemaNames.Fields.PlacingCounty] = record[SchemaNames.Fields.PlacingCounty];
+                if (juvenile != null) care[SchemaNames.Fields.DayOfCareBjjsId] = bjjsId; if (record.Contains(SchemaNames.Fields.PlacingCounty)) care[SchemaNames.Fields.PlacingCounty] = record[SchemaNames.Fields.PlacingCounty];
                 ApplyExceptionDetails(care);
                 careCreates.Add(care);
                 trace.Trace("Queued Day of Care for Facility Record {0}. Days Away={1}; Billing={2} ({3}); Reason={4} ({5}).", record.Id, daysAway, billingLabel, billingValue.HasValue ? billingValue.Value.ToString() : "not found", reasonLabel ?? "(purpose blank)", reasonValue.HasValue ? reasonValue.Value.ToString() : "not set");
@@ -204,7 +204,7 @@ namespace GenerateDailyRecordsPlugin
             AddIfMissing(care, SchemaNames.Fields.Billing, missing);
             AddIfMissing(care, SchemaNames.Fields.FacilityRecord, missing);
             AddIfMissing(care, SchemaNames.Fields.CensusCode, missing);
-            AddIfMissing(care, SchemaNames.Fields.BjjsId, missing);
+            AddIfMissing(care, SchemaNames.Fields.DayOfCareBjjsId, missing);
             AddIfMissing(care, SchemaNames.Fields.PlacingCounty, missing);
             AddIfMissing(care, SchemaNames.Fields.Facility, missing);
             AddIfMissing(care, SchemaNames.Fields.LivingArea, missing);
