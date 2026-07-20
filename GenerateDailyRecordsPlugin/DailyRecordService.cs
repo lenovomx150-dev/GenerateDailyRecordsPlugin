@@ -209,7 +209,7 @@ namespace GenerateDailyRecordsPlugin
             AddIfMissing(care, SchemaNames.Fields.Facility, missing);
             AddIfMissing(care, SchemaNames.Fields.LivingArea, missing);
             var hasException = missing.Count > 0;
-            care[SchemaNames.Fields.ExceptionStatus] = hasException;
+            care[SchemaNames.Fields.ExceptionStatus] = new OptionSetValue(hasException ? 0 : 1);
             care[SchemaNames.Fields.ExceptionDetails] = hasException ? "Missing required Day of Care fields: " + string.Join(", ", missing) : null;
             if (hasException) trace.Trace("Day of Care for Facility Record {0} has an exception: {1}", ReferenceId(care.GetAttributeValue<EntityReference>(SchemaNames.Fields.FacilityRecord)), string.Join(", ", missing));
         }
@@ -220,7 +220,11 @@ namespace GenerateDailyRecordsPlugin
         }
         private void SendExceptionEmails(IEnumerable<Entity> createdCare)
         {
-            var exceptionRecords = createdCare.Where(x => x.GetAttributeValue<bool>(SchemaNames.Fields.ExceptionStatus)).ToList();
+            var exceptionRecords = createdCare.Where(x =>
+            {
+                var exceptionStatus = x.GetAttributeValue<OptionSetValue>(SchemaNames.Fields.ExceptionStatus);
+                return exceptionStatus != null && exceptionStatus.Value == 0;
+            }).ToList();
             if (exceptionRecords.Count == 0) return;
             var recipients = Query("systemuser", new ColumnSet("internalemailaddress", "firstname", "lastname"), Filter("internalemailaddress", ConditionOperator.Equal, "c-gkoukunt@pa.gov"), Filter("firstname", ConditionOperator.Equal, "Goutham Reddy"), Filter("lastname", ConditionOperator.Equal, "Koukuntla"));
             var recipient = recipients.FirstOrDefault();
