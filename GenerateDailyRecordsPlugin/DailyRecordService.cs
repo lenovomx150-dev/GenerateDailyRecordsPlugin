@@ -5,6 +5,8 @@ using Microsoft.Xrm.Sdk;
 using Microsoft.Xrm.Sdk.Messages;
 using Microsoft.Xrm.Sdk.Metadata;
 using Microsoft.Xrm.Sdk.Query;
+using Microsoft.Xrm.Sdk.Organization;
+using Microsoft.Crm.Sdk.Messages;
 
 namespace GenerateDailyRecordsPlugin
 {
@@ -13,11 +15,14 @@ namespace GenerateDailyRecordsPlugin
         private readonly IOrganizationService service;
         private readonly ITracingService trace;
         private readonly DateTime today;
+        private readonly Guid emailSenderId;
         private readonly Dictionary<string, int> optionValueCache = new Dictionary<string, int>();
         private readonly HashSet<string> tracedLookupFields = new HashSet<string>();
-        internal DailyRecordService(IOrganizationService service, ITracingService trace, DateTime today) { this.service = service; this.trace = trace; this.today = today.Date; }
+        internal DailyRecordService(IOrganizationService service, ITracingService trace, DateTime today, Guid emailSenderId) { this.service = service; this.trace = trace; this.today = today.Date; this.emailSenderId = emailSenderId; }
         internal void Generate()
         {
+            DeactivatePreviousDayOfCareRecords();
+            ActivateTodaysDayOfCareRecords();
             var facilities = Query(SchemaNames.Entities.Facility, new ColumnSet(SchemaNames.Fields.Name));
             trace.Trace("Found {0} facilities to process.", facilities.Count);
             foreach (var facility in facilities)
@@ -93,7 +98,7 @@ namespace GenerateDailyRecordsPlugin
                     }
                     else
                     {
-                        var resident = new Entity(SchemaNames.Entities.UnitCensusResident); resident[SchemaNames.Fields.Name] = record.Id.ToString(); resident[SchemaNames.Fields.UnitCensus] = unit; resident[SchemaNames.Fields.DailyCensus] = daily; resident[SchemaNames.Fields.FacilityRecord] = record.ToEntityReference(); resident[SchemaNames.Fields.Facility] = facility.ToEntityReference(); resident[SchemaNames.Fields.LivingArea] = area; if (record.Contains(SchemaNames.Fields.FacilityRecordJuvenile)) resident[SchemaNames.Fields.UnitCensusResidentJuvenile] = record[SchemaNames.Fields.FacilityRecordJuvenile]; if (absence != null && absence.Contains(SchemaNames.Fields.Purpose)) resident[SchemaNames.Fields.Purpose] = absence[SchemaNames.Fields.Purpose]; residentCreates.Add(resident);
+                        var resident = new Entity(SchemaNames.Entities.UnitCensusResident); resident[SchemaNames.Fields.Name] = record.Id + " - " + today.ToString("MM/dd/yyyy"); resident[SchemaNames.Fields.UnitCensus] = unit; resident[SchemaNames.Fields.DailyCensus] = daily; resident[SchemaNames.Fields.FacilityRecord] = record.ToEntityReference(); resident[SchemaNames.Fields.Facility] = facility.ToEntityReference(); resident[SchemaNames.Fields.LivingArea] = area; if (record.Contains(SchemaNames.Fields.FacilityRecordJuvenile)) resident[SchemaNames.Fields.UnitCensusResidentJuvenile] = record[SchemaNames.Fields.FacilityRecordJuvenile]; if (absence != null && absence.Contains(SchemaNames.Fields.Purpose)) resident[SchemaNames.Fields.Purpose] = absence[SchemaNames.Fields.Purpose]; residentCreates.Add(resident);
                         trace.Trace("Queued Unit Census Resident for Facility Record {0}. Unit Census={1}; Purpose={2}.", record.Id, unit.Id, PurposeDetails(absence));
                     }
                 }
@@ -114,10 +119,14 @@ namespace GenerateDailyRecordsPlugin
                 var reasonValue = string.IsNullOrWhiteSpace(reasonLabel) ? (int?)null : FindOptionValue(SchemaNames.Entities.DayOfCare, SchemaNames.Fields.CensusCode, reasonLabel);
                 if (reasonValue.HasValue) care[SchemaNames.Fields.CensusCode] = new OptionSetValue(reasonValue.Value);
                 else trace.Trace("Day of Care reason was not set for Facility Record {0}. Source purpose={1}; matching Day of Care choice='{2}'.", record.Id, PurposeDetails(absence), reasonLabel ?? "(purpose blank)");
-                if (juvenile != null) care["ucm_bjjsid"] = bjjsId; if (record.Contains(SchemaNames.Fields.PlacingCounty)) care[SchemaNames.Fields.PlacingCounty] = record[SchemaNames.Fields.PlacingCounty]; careCreates.Add(care);
+                if (juvenile != null) care[SchemaNames.Fields.BjjsId] = bjjsId; if (record.Contains(SchemaNames.Fields.PlacingCounty)) care[SchemaNames.Fields.PlacingCounty] = record[SchemaNames.Fields.PlacingCounty];
+                ApplyExceptionDetails(care);
+                careCreates.Add(care);
                 trace.Trace("Queued Day of Care for Facility Record {0}. Days Away={1}; Billing={2} ({3}); Reason={4} ({5}).", record.Id, daysAway, billingLabel, billingValue.HasValue ? billingValue.Value.ToString() : "not found", reasonLabel ?? "(purpose blank)", reasonValue.HasValue ? reasonValue.Value.ToString() : "not set");
             }
-            var createdResidents = CreateBatch(residentCreates, "Unit Census Resident"); var createdCare = CreateBatch(careCreates, "Day of Care"); foreach (var unit in units.Values) { var total = createdResidents.Count(r => ((EntityReference)r[SchemaNames.Fields.UnitCensus]).Id == unit.Id); var update = new Entity(SchemaNames.Entities.UnitCensus, unit.Id); update[SchemaNames.Fields.ResidentsTotal] = total; service.Update(update); trace.Trace("Updated Unit Census {0}: Total Residents={1}.", unit.Id, total); }
+            var createdResidents = CreateBatch(residentCreates, "Unit Census Resident"); var createdCare = CreateBatch(careCreates, "Day of Care");
+            SendExceptionEmails(createdCare);
+            foreach (var unit in units.Values) { var total = createdResidents.Count(r => ((EntityReference)r[SchemaNames.Fields.UnitCensus]).Id == unit.Id); var update = new Entity(SchemaNames.Entities.UnitCensus, unit.Id); update[SchemaNames.Fields.ResidentsTotal] = total; service.Update(update); trace.Trace("Updated Unit Census {0}: Total Residents={1}.", unit.Id, total); }
             var censusUpdate = new Entity(SchemaNames.Entities.DailyCensus, dailyId); censusUpdate[SchemaNames.Fields.ResidentsTotal] = createdResidents.Count; service.Update(censusUpdate);
             trace.Trace("Completed {0}: {1} unit censuses, {2} residents, {3} day-of-care.", facilityName, units.Count, createdResidents.Count, createdCare.Count);
         }
@@ -146,7 +155,7 @@ namespace GenerateDailyRecordsPlugin
             if (optionValueCache.TryGetValue(cacheKey, out cachedValue)) return cachedValue;
             var request = new RetrieveAttributeRequest { EntityLogicalName = entityName, LogicalName = fieldName, RetrieveAsIfPublished = true };
             var response = (RetrieveAttributeResponse)service.Execute(request);
-            var attribute = response.AttributeMetadata as PicklistAttributeMetadata;
+            var attribute = response.AttributeMetadata as EnumAttributeMetadata;
             if (attribute == null) { trace.Trace("Cannot resolve choice '{0}': {1}.{2} is not an option-set field.", label, entityName, fieldName); return null; }
             var matchingOption = attribute.OptionSet.Options.FirstOrDefault(x => x.Value.HasValue && NormalizeLabel(OptionLabel(x)) == NormalizeLabel(label));
             if (matchingOption == null) { trace.Trace("Cannot resolve choice '{0}' on {1}.{2}: no matching option is configured.", label, entityName, fieldName); return null; }
@@ -166,6 +175,89 @@ namespace GenerateDailyRecordsPlugin
             }
             catch (Exception ex) { trace.Trace("Could not read lookup configuration for {0}.{1}. Exception: {2}", entityName, fieldName, ex); }
         }
+        private void DeactivatePreviousDayOfCareRecords()
+        {
+            var priorRecords = Query(SchemaNames.Entities.DayOfCare, new ColumnSet(false), Filter(SchemaNames.Fields.Date, ConditionOperator.LessThan, today));
+            foreach (var priorRecord in priorRecords)
+            {
+                var update = new Entity(SchemaNames.Entities.DayOfCare, priorRecord.Id);
+                // The business status configured for inactive Day of Care records is statuscode 0.
+                update[SchemaNames.Fields.StatusCode] = new OptionSetValue(0);
+                service.Update(update);
+            }
+            trace.Trace("Set statuscode=0 (Inactive) on {0} Day of Care records dated before {1:yyyy-MM-dd}.", priorRecords.Count, today);
+        }
+        private void ActivateTodaysDayOfCareRecords()
+        {
+            var activeStatus = FindOptionValue(SchemaNames.Entities.DayOfCare, SchemaNames.Fields.StatusCode, "Active");
+            if (!activeStatus.HasValue)
+            {
+                trace.Trace("Could not explicitly activate today's Day of Care records because no statuscode option labelled 'Active' was found.");
+                return;
+            }
+            var todaysRecords = Query(SchemaNames.Entities.DayOfCare, new ColumnSet(false), Filter(SchemaNames.Fields.Date, ConditionOperator.On, today));
+            foreach (var record in todaysRecords)
+            {
+                var update = new Entity(SchemaNames.Entities.DayOfCare, record.Id);
+                update[SchemaNames.Fields.StatusCode] = new OptionSetValue(activeStatus.Value);
+                service.Update(update);
+            }
+            trace.Trace("Set statuscode={0} (Active) on {1} Day of Care records dated {2:yyyy-MM-dd}.", activeStatus.Value, todaysRecords.Count, today);
+        }
+        private void ApplyExceptionDetails(Entity care)
+        {
+            var missing = new List<string>();
+            AddIfMissing(care, SchemaNames.Fields.Date, missing);
+            AddIfMissing(care, SchemaNames.Fields.Billing, missing);
+            AddIfMissing(care, SchemaNames.Fields.FacilityRecord, missing);
+            AddIfMissing(care, SchemaNames.Fields.CensusCode, missing);
+            AddIfMissing(care, SchemaNames.Fields.BjjsId, missing);
+            AddIfMissing(care, SchemaNames.Fields.PlacingCounty, missing);
+            AddIfMissing(care, SchemaNames.Fields.Facility, missing);
+            AddIfMissing(care, SchemaNames.Fields.LivingArea, missing);
+            var hasException = missing.Count > 0;
+            care[SchemaNames.Fields.ExceptionStatus] = hasException;
+            care[SchemaNames.Fields.ExceptionDetails] = hasException ? "Missing required Day of Care fields: " + string.Join(", ", missing) : null;
+            if (hasException) trace.Trace("Day of Care for Facility Record {0} has an exception: {1}", ReferenceId(care.GetAttributeValue<EntityReference>(SchemaNames.Fields.FacilityRecord)), string.Join(", ", missing));
+        }
+        private static void AddIfMissing(Entity entity, string fieldName, List<string> missing)
+        {
+            object value;
+            if (!entity.Attributes.TryGetValue(fieldName, out value) || value == null || (value is string && string.IsNullOrWhiteSpace((string)value))) missing.Add(fieldName);
+        }
+        private void SendExceptionEmails(IEnumerable<Entity> createdCare)
+        {
+            var exceptionRecords = createdCare.Where(x => x.GetAttributeValue<bool>(SchemaNames.Fields.ExceptionStatus)).ToList();
+            if (exceptionRecords.Count == 0) return;
+            var recipients = Query("systemuser", new ColumnSet("internalemailaddress", "firstname", "lastname"), Filter("internalemailaddress", ConditionOperator.Equal, "c-gkoukunt@pa.gov"), Filter("firstname", ConditionOperator.Equal, "Goutham Reddy"), Filter("lastname", ConditionOperator.Equal, "Koukuntla"));
+            var recipient = recipients.FirstOrDefault();
+            if (recipient == null) { trace.Trace("Could not send Day of Care exception email: no active Dataverse user has c-gkoukunt@pa.gov."); return; }
+            string organizationUrl = null;
+            try { ((RetrieveCurrentOrganizationResponse)service.Execute(new RetrieveCurrentOrganizationRequest())).Detail.Endpoints.TryGetValue(EndpointType.WebApplication, out organizationUrl); }
+            catch (Exception ex) { trace.Trace("Could not retrieve the organization URL for Day of Care exception emails: {0}", ex.Message); }
+            foreach (var care in exceptionRecords)
+            {
+                try
+                {
+                    var recordUrl = string.IsNullOrWhiteSpace(organizationUrl) ? null : organizationUrl.TrimEnd('/') + "/main.aspx?pagetype=entityrecord&etn=" + SchemaNames.Entities.DayOfCare + "&id=" + care.Id;
+                    var body = "A Day of Care record was created with an exception.<br/><br/>" +
+                        "Name: " + Html(care.GetAttributeValue<string>(SchemaNames.Fields.Name)) + "<br/>" +
+                        "Day of Care GUID: " + care.Id + "<br/>" +
+                        "Exception: " + Html(care.GetAttributeValue<string>(SchemaNames.Fields.ExceptionDetails)) +
+                        (recordUrl == null ? "" : "<br/><br/><a href=\"" + recordUrl + "\">Open the Day of Care record</a>");
+                    var email = new Entity("email");
+                    email["subject"] = "Day of Care exception: " + (care.GetAttributeValue<string>(SchemaNames.Fields.Name) ?? care.Id.ToString());
+                    email["description"] = body;
+                    email["from"] = new[] { new Entity("activityparty") { ["partyid"] = new EntityReference("systemuser", emailSenderId) } };
+                    email["to"] = new[] { new Entity("activityparty") { ["partyid"] = recipient.ToEntityReference() } };
+                    var emailId = service.Create(email);
+                    service.Execute(new SendEmailRequest { EmailId = emailId, IssueSend = true, TrackingToken = string.Empty });
+                    trace.Trace("Sent Day of Care exception email for {0} to c-gkoukunt@pa.gov.", care.Id);
+                }
+                catch (Exception ex) { trace.Trace("Failed to send Day of Care exception email for {0}: {1}", care.Id, ex); }
+            }
+        }
+        private static string Html(string value) { return System.Security.SecurityElement.Escape(value ?? "") ?? ""; }
         private static string OptionLabel(OptionMetadata option) { return option.Label == null ? "" : option.Label.UserLocalizedLabel == null ? option.Label.LocalizedLabels.Select(x => x.Label).FirstOrDefault() ?? "" : option.Label.UserLocalizedLabel.Label; }
         private static string NormalizeLabel(string label) { return (label ?? "").Replace('\u2013', '-').Replace('\u2014', '-').Trim().ToUpperInvariant(); }
         private List<Entity> CreateBatch(List<Entity> entities, string entityLabel)

@@ -21,7 +21,7 @@ namespace GenerateDailyRecordsPlugin
             tracing.Trace("ucm_GenerateDailyRecords started. Correlation: {0}", context.CorrelationId);
             try
             {
-                new DailyRecordService(service, tracing, DateTime.UtcNow.Date).Generate();
+                new DailyRecordService(service, tracing, DateTime.UtcNow.Date, context.UserId).Generate();
                 tracing.Trace("ucm_GenerateDailyRecords completed.");
             }
             catch (Exception ex)
