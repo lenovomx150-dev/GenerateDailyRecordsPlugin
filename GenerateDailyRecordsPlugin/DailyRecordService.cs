@@ -181,28 +181,21 @@ namespace GenerateDailyRecordsPlugin
             foreach (var priorRecord in priorRecords)
             {
                 var update = new Entity(SchemaNames.Entities.DayOfCare, priorRecord.Id);
-                // The business status configured for inactive Day of Care records is statuscode 0.
-                update[SchemaNames.Fields.StatusCode] = new OptionSetValue(0);
+                update[SchemaNames.Fields.StateCode] = new OptionSetValue(1);
                 service.Update(update);
             }
-            trace.Trace("Set statuscode=0 (Inactive) on {0} Day of Care records dated before {1:yyyy-MM-dd}.", priorRecords.Count, today);
+            trace.Trace("Set statecode=1 (Inactive) on {0} Day of Care records dated before {1:yyyy-MM-dd}.", priorRecords.Count, today);
         }
         private void ActivateTodaysDayOfCareRecords()
         {
-            var activeStatus = FindOptionValue(SchemaNames.Entities.DayOfCare, SchemaNames.Fields.StatusCode, "Active");
-            if (!activeStatus.HasValue)
-            {
-                trace.Trace("Could not explicitly activate today's Day of Care records because no statuscode option labelled 'Active' was found.");
-                return;
-            }
             var todaysRecords = Query(SchemaNames.Entities.DayOfCare, new ColumnSet(false), Filter(SchemaNames.Fields.Date, ConditionOperator.On, today));
             foreach (var record in todaysRecords)
             {
                 var update = new Entity(SchemaNames.Entities.DayOfCare, record.Id);
-                update[SchemaNames.Fields.StatusCode] = new OptionSetValue(activeStatus.Value);
+                update[SchemaNames.Fields.StateCode] = new OptionSetValue(0);
                 service.Update(update);
             }
-            trace.Trace("Set statuscode={0} (Active) on {1} Day of Care records dated {2:yyyy-MM-dd}.", activeStatus.Value, todaysRecords.Count, today);
+            trace.Trace("Set statecode=0 (Active) on {0} Day of Care records dated {1:yyyy-MM-dd}.", todaysRecords.Count, today);
         }
         private void ApplyExceptionDetails(Entity care)
         {
