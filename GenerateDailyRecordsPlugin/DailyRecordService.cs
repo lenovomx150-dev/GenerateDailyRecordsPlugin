@@ -245,7 +245,8 @@ namespace GenerateDailyRecordsPlugin
                     var email = new Entity("email");
                     email["subject"] = "Day of Care exception: " + (care.GetAttributeValue<string>(SchemaNames.Fields.Name) ?? care.Id.ToString());
                     email["description"] = body;
-                    email["from"] = new[] { new Entity("activityparty") { ["partyid"] = new EntityReference("systemuser", emailSenderId) } };
+                    //email["from"] = new[] { new Entity("activityparty") { ["partyid"] = new EntityReference("systemuser", emailSenderId) } };
+                    email["from"] = new[] { new Entity("activityparty") { ["partyid"] = recipient.ToEntityReference() } };
                     email["to"] = new[] { new Entity("activityparty") { ["partyid"] = recipient.ToEntityReference() } };
                     var emailId = service.Create(email);
                     service.Execute(new SendEmailRequest { EmailId = emailId, IssueSend = true, TrackingToken = string.Empty });
