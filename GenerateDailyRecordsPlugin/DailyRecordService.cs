@@ -45,11 +45,13 @@ namespace GenerateDailyRecordsPlugin
             var existing = Query(SchemaNames.Entities.DailyCensus, new ColumnSet(false), Filter(SchemaNames.Fields.Facility, ConditionOperator.Equal, facility.Id), Filter(SchemaNames.Fields.Name, ConditionOperator.Equal, censusName)).FirstOrDefault();
             Guid dailyId;
             EntityReference daily;
+            var dailyCensusCreatedThisRun = false;
             if (existing == null)
             {
                 var census = new Entity(SchemaNames.Entities.DailyCensus); census[SchemaNames.Fields.Name] = censusName; census[SchemaNames.Fields.Facility] = facility.ToEntityReference();
                 dailyId = service.Create(census);
                 daily = new EntityReference(SchemaNames.Entities.DailyCensus, dailyId);
+                dailyCensusCreatedThisRun = true;
             }
             else
             {
@@ -118,7 +120,10 @@ namespace GenerateDailyRecordsPlugin
                 ApplyExceptionDetails(care);
                 careCreates.Add(care);
             }
-            var createdResidents = CreateBatch(residentCreates, "Unit Census Resident"); var createdCare = CreateBatch(careCreates, "Day of Care");
+            // ExecuteMultiple cannot resolve a Daily Census created in this same plug-in transaction.
+            // Direct creates share the transaction and keep first-run resident creation reliable.
+            var createdResidents = dailyCensusCreatedThisRun ? CreateDirectly(residentCreates, "Unit Census Resident") : CreateBatch(residentCreates, "Unit Census Resident");
+            var createdCare = CreateBatch(careCreates, "Day of Care");
             var createdResidentRecordIds = new HashSet<Guid>(createdResidents.Where(x => x.Contains(SchemaNames.Fields.FacilityRecord)).Select(x => x.GetAttributeValue<EntityReference>(SchemaNames.Fields.FacilityRecord).Id));
             residentSummary.Created = residentSummary.QueuedFacilityRecordIds.Count(id => createdResidentRecordIds.Contains(id));
             residentSummary.Failed = residentSummary.QueuedFacilityRecordIds.Count - residentSummary.Created;
@@ -315,6 +320,25 @@ namespace GenerateDailyRecordsPlugin
                 }
             }
             trace.Trace("{0} batch completed. Requested={1}; Succeeded={2}; Failed={3}; Not Executed={4}.", entityLabel, entities.Count, succeeded, failed, notExecuted);
+            return created;
+        }
+        private List<Entity> CreateDirectly(List<Entity> entities, string entityLabel)
+        {
+            var created = new List<Entity>();
+            for (var index = 0; index < entities.Count; index++)
+            {
+                var entity = entities[index];
+                try
+                {
+                    entity.Id = service.Create(entity);
+                    created.Add(entity);
+                }
+                catch (Exception ex)
+                {
+                    AddBatchFailure(entityLabel, index, entity, "Direct create failed: " + ex.Message);
+                }
+            }
+            if (entities.Count > 0) trace.Trace("{0} direct-create completed. Requested={1}; Succeeded={2}; Failed={3}.", entityLabel, entities.Count, created.Count, entities.Count - created.Count);
             return created;
         }
         private void AddBatchFailure(string entityLabel, int index, Entity target, string reason)
