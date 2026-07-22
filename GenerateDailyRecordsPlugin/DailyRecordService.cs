@@ -20,19 +20,21 @@ namespace GenerateDailyRecordsPlugin
         private readonly HashSet<string> tracedLookupFields = new HashSet<string>();
         // Kept until the end of the run so the important resident decisions survive Dataverse trace truncation.
         private readonly List<string> unitCensusResidentRunSummary = new List<string>();
+        private readonly List<string> batchFailureSummary = new List<string>();
+        private int omittedBatchFailureCount;
         internal DailyRecordService(IOrganizationService service, ITracingService trace, DateTime today, Guid emailSenderId) { this.service = service; this.trace = trace; this.today = today.Date; this.emailSenderId = emailSenderId; }
         internal void Generate()
         {
             DeactivatePreviousDayOfCareRecords();
             ActivateTodaysDayOfCareRecords();
             var facilities = Query(SchemaNames.Entities.Facility, new ColumnSet(SchemaNames.Fields.Name));
-            trace.Trace("Found {0} facilities to process.", facilities.Count);
             foreach (var facility in facilities)
             {
                 try { GenerateFacility(facility); }
                 catch (Exception ex) { trace.Trace("Facility {0} failed. Exception: {1}", facility.Id, ex); }
             }
             trace.Trace("UNIT CENSUS RESIDENT RUN SUMMARY ({0:yyyy-MM-dd})\n{1}", today, unitCensusResidentRunSummary.Count == 0 ? "No facilities processed." : string.Join("\n", unitCensusResidentRunSummary));
+            trace.Trace("BATCH FAILURE SUMMARY ({0:yyyy-MM-dd})\n{1}", today, batchFailureSummary.Count == 0 ? "No batch failures." : string.Join("\n", batchFailureSummary) + (omittedBatchFailureCount == 0 ? "" : "\nAdditional batch failures omitted: " + omittedBatchFailureCount + "."));
         }
         private void GenerateFacility(Entity facility)
         {
@@ -48,73 +50,59 @@ namespace GenerateDailyRecordsPlugin
                 var census = new Entity(SchemaNames.Entities.DailyCensus); census[SchemaNames.Fields.Name] = censusName; census[SchemaNames.Fields.Facility] = facility.ToEntityReference();
                 dailyId = service.Create(census);
                 daily = new EntityReference(SchemaNames.Entities.DailyCensus, dailyId);
-                trace.Trace("Created Daily Census {0} for facility '{1}'.", dailyId, facilityName);
             }
             else
             {
                 dailyId = existing.Id;
                 daily = existing.ToEntityReference();
-                trace.Trace("Reusing Daily Census {0} for facility '{1}'.", dailyId, facilityName);
             }
-            TraceLookupTargets(SchemaNames.Entities.UnitCensusResident, SchemaNames.Fields.DailyCensus);
-            TraceLookupTargets(SchemaNames.Entities.UnitCensusResident, SchemaNames.Fields.UnitCensus);
             var areas = Query(SchemaNames.Entities.LivingArea, new ColumnSet(SchemaNames.Fields.Name), Filter(SchemaNames.Fields.Facility, ConditionOperator.Equal, facility.Id));
-            trace.Trace("Found {0} Living Areas for facility '{1}'.", areas.Count, facilityName);
             var existingUnits = Query(SchemaNames.Entities.UnitCensus, new ColumnSet(SchemaNames.Fields.LivingArea), Filter(SchemaNames.Fields.DailyCensus, ConditionOperator.Equal, dailyId));
             var units = existingUnits.Where(x => x.Contains(SchemaNames.Fields.LivingArea)).GroupBy(x => x.GetAttributeValue<EntityReference>(SchemaNames.Fields.LivingArea).Id).ToDictionary(x => x.Key, x => x.First().ToEntityReference());
             foreach (var area in areas)
             {
                 if (units.ContainsKey(area.Id))
                 {
-                    trace.Trace("Reusing Unit Census {0} for Living Area '{1}' ({2}).", units[area.Id].Id, area.GetAttributeValue<string>(SchemaNames.Fields.Name) ?? "(no name)", area.Id);
                     continue;
                 }
                 var unit = new Entity(SchemaNames.Entities.UnitCensus); unit[SchemaNames.Fields.Name] = NameHelper.Census(area.GetAttributeValue<string>(SchemaNames.Fields.Name) ?? area.Id.ToString(), today); unit[SchemaNames.Fields.DailyCensus] = daily; unit[SchemaNames.Fields.Facility] = facility.ToEntityReference(); unit[SchemaNames.Fields.LivingArea] = area.ToEntityReference();
                 var unitId = service.Create(unit);
                 units.Add(area.Id, new EntityReference(SchemaNames.Entities.UnitCensus, unitId));
-                trace.Trace("Created Unit Census {0} for Living Area '{1}' ({2}).", unitId, area.GetAttributeValue<string>(SchemaNames.Fields.Name) ?? "(no name)", area.Id);
             }
             var records = Query(SchemaNames.Entities.FacilityRecord, new ColumnSet(SchemaNames.Fields.FacilityRecordFacility, SchemaNames.Fields.CurrentLivingArea, SchemaNames.Fields.FacilityRecordJuvenile, SchemaNames.Fields.PlacingCounty), Filter(SchemaNames.Fields.FacilityRecordFacility, ConditionOperator.Equal, facility.Id), Filter(SchemaNames.Fields.StateCode, ConditionOperator.Equal, 0));
-            trace.Trace("Found {0} active Facility Records for facility '{1}'.", records.Count, facilityName);
             var existingResidents = Query(SchemaNames.Entities.UnitCensusResident, new ColumnSet(SchemaNames.Fields.FacilityRecord), Filter(SchemaNames.Fields.DailyCensus, ConditionOperator.Equal, dailyId));
             var existingResidentRecordIds = new HashSet<Guid>(existingResidents.Where(x => x.Contains(SchemaNames.Fields.FacilityRecord)).Select(x => x.GetAttributeValue<EntityReference>(SchemaNames.Fields.FacilityRecord).Id));
             var existingCare = Query(SchemaNames.Entities.DayOfCare, new ColumnSet(SchemaNames.Fields.FacilityRecord), Filter(SchemaNames.Fields.Date, ConditionOperator.On, today));
             var existingCareRecordIds = new HashSet<Guid>(existingCare.Where(x => x.Contains(SchemaNames.Fields.FacilityRecord)).Select(x => x.GetAttributeValue<EntityReference>(SchemaNames.Fields.FacilityRecord).Id));
-            trace.Trace("Duplicate protection found {0} Unit Census Residents and {1} Day of Care records already created today.", existingResidentRecordIds.Count, existingCareRecordIds.Count);
             var juvenileIds = records.Where(r => r.Contains(SchemaNames.Fields.FacilityRecordJuvenile)).Select(r => r.GetAttributeValue<EntityReference>(SchemaNames.Fields.FacilityRecordJuvenile).Id).Distinct().ToArray();
             var juveniles = juvenileIds.Length == 0 ? new List<Entity>() : Query(SchemaNames.Entities.Juvenile, new ColumnSet(SchemaNames.Fields.FullName, SchemaNames.Fields.JuvenileBjjsId), FilterIn("ucm_offenderid", juvenileIds));
             var bjjsByJuvenile = juveniles.ToDictionary(j => j.Id, j => j.GetAttributeValue<string>(SchemaNames.Fields.JuvenileBjjsId));
             var residentNameByJuvenile = juveniles.ToDictionary(j => j.Id, j => j.GetAttributeValue<string>(SchemaNames.Fields.FullName));
             var absences = Query(SchemaNames.Entities.TemporaryAbsence, new ColumnSet(SchemaNames.Fields.FacilityRecordMovement, SchemaNames.Fields.Purpose, SchemaNames.Fields.AbsenceStart, SchemaNames.Fields.AbsenceEnd), Filter(SchemaNames.Fields.StateCode, ConditionOperator.Equal, 0), Filter(SchemaNames.Fields.AbsenceStart, ConditionOperator.OnOrBefore, today));
             var absenceByRecord = absences.Where(x => x.Contains(SchemaNames.Fields.FacilityRecordMovement) && (!x.Contains(SchemaNames.Fields.AbsenceEnd) || x.GetAttributeValue<DateTime>(SchemaNames.Fields.AbsenceEnd).Date >= today)).GroupBy(x => x.GetAttributeValue<EntityReference>(SchemaNames.Fields.FacilityRecordMovement).Id).ToDictionary(x => x.Key, x => x.First());
-            trace.Trace("Found {0} active Temporary Absences applicable today across all facilities; {1} are linked to Facility Records.", absences.Count, absenceByRecord.Count);
             var residentCreates = new List<Entity>(); var careCreates = new List<Entity>();
             foreach (var record in records)
             {
                 Entity absence; absenceByRecord.TryGetValue(record.Id, out absence); var area = record.GetAttributeValue<EntityReference>(SchemaNames.Fields.CurrentLivingArea); EntityReference unit;
                 var juvenileReference = record.GetAttributeValue<EntityReference>(SchemaNames.Fields.FacilityRecordJuvenile);
-                trace.Trace("Facility Record {0}: Juvenile={1}; Current Living Area={2}; Active Absence={3}; Purpose={4}.", record.Id, ReferenceId(juvenileReference), ReferenceId(area), absence == null ? "No" : "Yes", PurposeDetails(absence));
                 if (area != null && units.TryGetValue(area.Id, out unit))
                 {
                     if (existingResidentRecordIds.Contains(record.Id))
                     {
                         residentSummary.AlreadyExisted++;
-                        trace.Trace("Skipped Unit Census Resident for Facility Record {0}: a resident record already exists today.", record.Id);
                     }
                     else
                     {
                         var resident = new Entity(SchemaNames.Entities.UnitCensusResident); resident[SchemaNames.Fields.Name] = record.Id + " - " + today.ToString("MM/dd/yyyy"); resident[SchemaNames.Fields.Date] = today; resident[SchemaNames.Fields.UnitCensus] = unit; resident[SchemaNames.Fields.DailyCensus] = daily; resident[SchemaNames.Fields.FacilityRecord] = record.ToEntityReference(); resident[SchemaNames.Fields.Facility] = facility.ToEntityReference(); resident[SchemaNames.Fields.LivingArea] = area; if (record.Contains(SchemaNames.Fields.FacilityRecordJuvenile)) resident[SchemaNames.Fields.UnitCensusResidentJuvenile] = record[SchemaNames.Fields.FacilityRecordJuvenile]; if (absence != null && absence.Contains(SchemaNames.Fields.Purpose)) resident[SchemaNames.Fields.Purpose] = absence[SchemaNames.Fields.Purpose]; residentCreates.Add(resident);
-                        trace.Trace("Queued Unit Census Resident for Facility Record {0}. Unit Census={1}; Purpose={2}.", record.Id, unit.Id, PurposeDetails(absence));
                         residentSummary.QueuedFacilityRecordIds.Add(record.Id);
                     }
                 }
                 else
                 {
                     residentSummary.UnmatchedLivingAreas.Add(record.Id + " / " + ReferenceId(area));
-                    trace.Trace("Did not queue Unit Census Resident for Facility Record {0}. Current Living Area is {1}.", record.Id, area == null ? "blank" : "not one of this facility's Living Areas (" + area.Id + ")");
                 }
                 var daysAway = absence == null ? 0 : (today - absence.GetAttributeValue<DateTime>(SchemaNames.Fields.AbsenceStart).Date).Days + 1; if (daysAway >= 7) continue;
-                if (existingCareRecordIds.Contains(record.Id)) { trace.Trace("Skipped Day of Care for Facility Record {0}: a Day of Care record already exists for {1:yyyy-MM-dd}.", record.Id, today); continue; }
+                if (existingCareRecordIds.Contains(record.Id)) continue;
                 var juvenile = juvenileReference; string bjjsId = null; string residentName = null; if (juvenile != null) { bjjsByJuvenile.TryGetValue(juvenile.Id, out bjjsId); residentNameByJuvenile.TryGetValue(juvenile.Id, out residentName); }
                 if (string.IsNullOrWhiteSpace(residentName) && juvenile != null) residentName = juvenile.Name; if (string.IsNullOrWhiteSpace(residentName)) residentName = bjjsId; if (string.IsNullOrWhiteSpace(residentName)) residentName = record.Id.ToString(); var care = new Entity(SchemaNames.Entities.DayOfCare); care[SchemaNames.Fields.Name] = NameHelper.Census(residentName, today); care[SchemaNames.Fields.FacilityRecord] = record.ToEntityReference(); care[SchemaNames.Fields.Date] = today; if (record.Contains(SchemaNames.Fields.FacilityRecordFacility)) care[SchemaNames.Fields.Facility] = record[SchemaNames.Fields.FacilityRecordFacility]; if (area != null) care[SchemaNames.Fields.LivingArea] = area;
                 var billingLabel = daysAway == 6 ? "Non-Billable" : "Billable";
@@ -129,7 +117,6 @@ namespace GenerateDailyRecordsPlugin
                 if (juvenile != null) care[SchemaNames.Fields.DayOfCareBjjsId] = bjjsId; if (record.Contains(SchemaNames.Fields.PlacingCounty)) care[SchemaNames.Fields.PlacingCounty] = record[SchemaNames.Fields.PlacingCounty];
                 ApplyExceptionDetails(care);
                 careCreates.Add(care);
-                trace.Trace("Queued Day of Care for Facility Record {0}. Days Away={1}; Billing={2} ({3}); Reason={4} ({5}).", record.Id, daysAway, billingLabel, billingValue.HasValue ? billingValue.Value.ToString() : "not found", reasonLabel ?? "(purpose blank)", reasonValue.HasValue ? reasonValue.Value.ToString() : "not set");
             }
             var createdResidents = CreateBatch(residentCreates, "Unit Census Resident"); var createdCare = CreateBatch(careCreates, "Day of Care");
             var createdResidentRecordIds = new HashSet<Guid>(createdResidents.Where(x => x.Contains(SchemaNames.Fields.FacilityRecord)).Select(x => x.GetAttributeValue<EntityReference>(SchemaNames.Fields.FacilityRecord).Id));
@@ -137,7 +124,7 @@ namespace GenerateDailyRecordsPlugin
             residentSummary.Failed = residentSummary.QueuedFacilityRecordIds.Count - residentSummary.Created;
             unitCensusResidentRunSummary.Add(residentSummary.ToTraceLine());
             SendExceptionEmails(createdCare);
-            foreach (var unit in units.Values) { var total = createdResidents.Count(r => ((EntityReference)r[SchemaNames.Fields.UnitCensus]).Id == unit.Id); var update = new Entity(SchemaNames.Entities.UnitCensus, unit.Id); update[SchemaNames.Fields.ResidentsTotal] = total; service.Update(update); trace.Trace("Updated Unit Census {0}: Total Residents={1}.", unit.Id, total); }
+            foreach (var unit in units.Values) { var total = createdResidents.Count(r => ((EntityReference)r[SchemaNames.Fields.UnitCensus]).Id == unit.Id); var update = new Entity(SchemaNames.Entities.UnitCensus, unit.Id); update[SchemaNames.Fields.ResidentsTotal] = total; service.Update(update); }
             var censusUpdate = new Entity(SchemaNames.Entities.DailyCensus, dailyId); censusUpdate[SchemaNames.Fields.ResidentsTotal] = createdResidents.Count; service.Update(censusUpdate);
             trace.Trace("Completed {0}: {1} unit censuses, {2} residents, {3} day-of-care.", facilityName, units.Count, createdResidents.Count, createdCare.Count);
         }
@@ -288,7 +275,7 @@ namespace GenerateDailyRecordsPlugin
         private List<Entity> CreateBatch(List<Entity> entities, string entityLabel)
         {
             var created = new List<Entity>();
-            if (entities.Count == 0) { trace.Trace("No {0} records to create.", entityLabel); return created; }
+            if (entities.Count == 0) return created;
             var request = new ExecuteMultipleRequest { Settings = new ExecuteMultipleSettings { ContinueOnError = true, ReturnResponses = true }, Requests = new OrganizationRequestCollection() };
             foreach (var entity in entities) request.Requests.Add(new CreateRequest { Target = entity });
             var response = (ExecuteMultipleResponse)service.Execute(request);
@@ -302,11 +289,13 @@ namespace GenerateDailyRecordsPlugin
                 if (batchItem == null)
                 {
                     notExecuted++;
+                    AddBatchFailure(entityLabel, index, target, "Not executed because an earlier request in the batch failed.");
                     trace.Trace("Did not create {0} at batch index {1}; it was not executed because an earlier request in this batch failed. Fields: {2}", entityLabel, index, DescribeFields(target));
                 }
                 else if (batchItem.Fault != null)
                 {
                     failed++;
+                    AddBatchFailure(entityLabel, index, target, "Error " + batchItem.Fault.ErrorCode + ": " + batchItem.Fault.Message);
                     trace.Trace("Failed to create {0} at batch index {1}. Fields: {2}. Error Code={3}; Message={4}; Details={5}", entityLabel, index, DescribeFields(target), batchItem.Fault.ErrorCode, batchItem.Fault.Message, FaultDetails(batchItem.Fault));
                 }
                 else
@@ -317,6 +306,7 @@ namespace GenerateDailyRecordsPlugin
                     {
                         failed++;
                         succeeded--;
+                        AddBatchFailure(entityLabel, index, target, "Dataverse returned no record ID.");
                         trace.Trace("Failed to create {0} at batch index {1}: Dataverse returned no record ID. Fields: {2}", entityLabel, index, DescribeFields(target));
                         continue;
                     }
@@ -326,6 +316,15 @@ namespace GenerateDailyRecordsPlugin
             }
             trace.Trace("{0} batch completed. Requested={1}; Succeeded={2}; Failed={3}; Not Executed={4}.", entityLabel, entities.Count, succeeded, failed, notExecuted);
             return created;
+        }
+        private void AddBatchFailure(string entityLabel, int index, Entity target, string reason)
+        {
+            if (batchFailureSummary.Count >= 25) { omittedBatchFailureCount++; return; }
+            var facility = target.GetAttributeValue<EntityReference>(SchemaNames.Fields.Facility);
+            var facilityRecord = target.GetAttributeValue<EntityReference>(SchemaNames.Fields.FacilityRecord);
+            var compactReason = (reason ?? "Unknown error.").Replace('\r', ' ').Replace('\n', ' ');
+            if (compactReason.Length > 500) compactReason = compactReason.Substring(0, 500) + "...";
+            batchFailureSummary.Add("Batch failure: entity=" + entityLabel + "; index=" + index + "; facility=" + ReferenceId(facility) + "; facility-record=" + ReferenceId(facilityRecord) + "; reason=" + compactReason);
         }
         private static string DescribeFields(Entity entity) { return string.Join(", ", entity.Attributes.Select(x => x.Key + "=" + (x.Value is EntityReference ? ReferenceId((EntityReference)x.Value) : x.Value is OptionSetValue ? ((OptionSetValue)x.Value).Value.ToString() : x.Value == null ? "(null)" : x.Value.ToString()))); }
         private static string FaultDetails(OrganizationServiceFault fault) { return fault == null ? "" : (string.IsNullOrWhiteSpace(fault.TraceText) ? "" : fault.TraceText) + (fault.InnerFault == null ? "" : " Inner Fault: " + FaultDetails(fault.InnerFault)); }
